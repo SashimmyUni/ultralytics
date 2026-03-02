@@ -619,16 +619,16 @@ def parse_opt() -> argparse.Namespace:
     nargs="+",
     type=str,
     default=[
-        "a person throwing a powerful punch with their left arm extended forward",
-        "a person throwing a powerful punch with their right arm extended forward",
-        "a person throwing a powerful uppercut with their right arm extended forward",
-        "a person throwing a powerful uppercut with their left arm extended forward",
-        "a person throwing a powerful hook with their right arm extended forward",
-        "a person throwing a powerful hook with their left arm extended forward",
-        "a person lifting and extending their right leg forward in a strong front kick",
-        "a person lifting and extending their left leg forward in a strong front kick",
-        "a person lifting and extending their left leg forward in a strong roundhouse kick",
-        "a person lifting and extending their right leg forward in a strong roundhouse kick",
+        "left punch",
+        "right punch",
+        "left uppercut",
+        "right uppercut",
+        "left hook",
+        "right hook",
+        "right front kick",
+        "left front kick",
+        "left roundhouse kick",
+        "right roundhouse kick",
     ],
     help="labels for zero-shot video classification",
 )
@@ -645,4 +645,4 @@ if __name__ == "__main__":
     main(opt)
 
 
-#python action_recognition.py --source "https://www.youtube.com/watch?v=KaGj0mNKZ_4" --device 0 --video-classifier-model "microsoft/xclip-base-patch32" --num-video-sequence-samples 8 --skip-frame 2 --video-cls-overlap-ratio 0.5 --fp16 --output-path Test2.mp4
+#python action_recognition.py --source "https://www.youtube.com/watch?v=y59uqLjD7Zs" --device 0 --video-classifier-model "microsoft/xclip-base-patch32" --num-video-sequence-samples 8 --skip-frame 2 --video-cls-overlap-ratio 0.5 --fp16 --output-path Test2.mp4
