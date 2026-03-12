@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import time
 from collections import defaultdict
+from pathlib import Path
 from urllib.parse import urlparse
 
 import cv2
@@ -280,6 +281,36 @@ class HuggingFaceVideoClassifier:
         return pred_labels, pred_confs
 
 
+
+
+def save_keypoint_sequences(track_kpts_history: dict[int, list[np.ndarray]], out_dir: str) -> None:
+    """Save stored keypoints for each track to disk.
+
+    Each track's sequence is written as a NumPy ``.npy`` file named
+    ``track_<id>.npy``.  The output directory is created if necessary.
+    """
+    path = Path(out_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    for tid, seq in track_kpts_history.items():
+        if len(seq) == 0:
+            continue
+        arr = np.stack(seq)  # shape (T, num_kpts, 2|3)
+        np.save(path / f"track_{tid}.npy", arr)
+
+
+def draw_pose_on_blank(kpts: np.ndarray, shape: tuple[int,int]) -> np.ndarray:
+    """Return a blank image with the pose skeleton drawn.
+
+    Args:
+        kpts (np.ndarray): Array of keypoints shape (N,2) or (N,3).
+        shape (tuple[int,int]): (height, width) of canvas.
+    """
+    canvas = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
+    annot = Annotator(canvas, line_width=3, font_size=10, pil=False)
+    annot.kpts(kpts, shape=shape)
+    return annot.im
+
+
 def crop_and_pad(frame: np.ndarray, box: list[float], margin_percent: int) -> np.ndarray:
     """Crop box with margin and take square crop from frame.
 
@@ -323,6 +354,11 @@ def run(
     fp16: bool = False,
     video_classifier_model: str = "microsoft/xclip-base-patch32",
     labels: list[str] | None = None,
+    save_kpts_dir: str | None = None,
+    visualize_pose: bool = False,
+    pose_output_path: str | None = None,
+    draw_boxes: bool = True,
+    overlay_pose: bool = True,
 ) -> None:
     """Run action recognition on a video source using YOLO for object detection (or pose
     estimation) and a video classifier.
@@ -344,16 +380,33 @@ def run(
         fp16 (bool): Whether to use half-precision floating point.
         video_classifier_model (str): Name or path of the video classifier model.
         labels (list[str], optional): List of labels for zero-shot classification.
+        save_kpts_dir (str, optional): Directory in which to store per-track keypoint
+            sequences.  If specified the folder will be created and each track will be
+            written as ``track_<id>.npy`` after processing completes.
+        visualize_pose (bool): If True, show a second window containing only the
+            skeleton overlay (black background) for each detected person.
+        pose_output_path (str, optional): Path to save a video of the pose-only window.
+            Only used when ``visualize_pose`` is True.  The file will have the same
+            resolution as the input frames.
+            If not provided the default ``datasets/pose_video.mp4`` will be used
+            (directory is created if necessary).
+        draw_boxes (bool): If False, bounding-box annotations will not be drawn on the
+            main video; useful when using pose models and you only want skeletons.
     """
-    if labels is None:
+
+    if labels is None or len(labels) == 0:
+        # fall back to a martial arts combat vocabulary if nothing was provided
         labels = [
-            "walking",
-            "running",
-            "brushing teeth",
-            "looking into phone",
-            "weight lifting",
-            "cooking",
-            "sitting",
+            "jab",              # quick straight punch
+            "cross",            # rear-hand straight punch
+            "hook",             # circular punch
+            "uppercut",         # upward punch
+            "front kick",
+            "roundhouse kick",
+            "side kick",
+            "block",
+            "dodge",
+            "sparring",
         ]
     # Initialize models and device
     device = select_device(device)
@@ -373,7 +426,11 @@ def run(
 
     # Initialize video capture
     if source.startswith("http") and urlparse(source).hostname in {"www.youtube.com", "youtube.com", "youtu.be"}:
-        source = get_best_youtube_url(source)
+        try:
+            source = get_best_youtube_url(source)
+        except Exception as e:
+            # some YouTube streams may have None resolutions; fall back to original URL
+            print(f"warning: failed to select best YouTube stream ({e}), using original URL")
     elif not source.endswith(".mp4"):
         raise ValueError("Invalid source. Supported sources are YouTube URLs and MP4 files.")
     cap = cv2.VideoCapture(source)
@@ -392,101 +449,150 @@ def run(
     track_history: dict[int, list[np.ndarray]] = defaultdict(list)
     track_kpts_history: dict[int, list[np.ndarray]] = defaultdict(list) if is_pose_model else {}
     frame_counter = 0
+    # prepare pose video writer if requested
+    pose_writer = None
+    if visualize_pose:
+        if pose_output_path is None:
+            # default to datasets folder
+            default_path = Path("datasets") / "pose_video.mp4"
+            default_path.parent.mkdir(parents=True, exist_ok=True)
+            pose_output_path = str(default_path)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        pose_writer = cv2.VideoWriter(pose_output_path, fourcc, fps, (frame_width, frame_height))
 
     track_ids_to_infer = []
     crops_to_infer: list[torch.Tensor] = []
     pred_labels: list = []
     pred_confs: list = []
 
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            break
+    try:
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                break
 
-        frame_counter += 1
+            frame_counter += 1
 
-        # Run YOLO tracking (works for pose models too)
-        results = yolo_model.track(frame, persist=True, classes=[0])  # Track only person class
+            # Run YOLO tracking (works for pose models too)
+            results = yolo_model.track(frame, persist=True, classes=[0])  # Track only person class
 
-        if results[0].boxes.is_track:
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            track_ids = results[0].boxes.id.cpu().numpy()
+            if results[0].boxes.is_track:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                track_ids = results[0].boxes.id.cpu().numpy()
 
-            # pull keypoints if provided by the model
-            kpt_arr = None
-            if is_pose_model and hasattr(results[0], "keypoints"):
-                kpt_arr = results[0].keypoints.cpu().numpy()  # (N,17,3)
+                # pull keypoints if provided by the model
+                kpt_arr = None
+                if is_pose_model and hasattr(results[0], "keypoints"):
+                    kpt_arr = results[0].keypoints.cpu().numpy()  # (N,17,3)
+                    # debug: report shapes so we know keypoints are arriving
+                    print(f"[debug] frame {frame_counter}: kpt_arr shape={kpt_arr.shape}")
 
-            # Visualize prediction
-            annotator = Annotator(frame, line_width=3, font_size=10, pil=False)
+                # Visualize prediction
+                annotator = Annotator(frame, line_width=3, font_size=10, pil=False)
 
-            if frame_counter % skip_frame == 0:
-                crops_to_infer = []
-                track_ids_to_infer = []
-
-            for i, (box, track_id) in enumerate(zip(boxes, track_ids)):
                 if frame_counter % skip_frame == 0:
-                    crop = crop_and_pad(frame, box, crop_margin_percentage)
-                    track_history[track_id].append(crop)
-                    # store keypoints history if pose model
-                    if kpt_arr is not None:
-                        track_kpts_history.setdefault(track_id, []).append(kpt_arr[i])
+                    crops_to_infer = []
+                    track_ids_to_infer = []
 
-                if len(track_history[track_id]) > num_video_sequence_samples:
-                    track_history[track_id].pop(0)
-                    if is_pose_model:
-                        track_kpts_history[track_id].pop(0)
+                for i, (box, track_id) in enumerate(zip(boxes, track_ids)):
+                    if frame_counter % skip_frame == 0:
+                        crop = crop_and_pad(frame, box, crop_margin_percentage)
+                        track_history[track_id].append(crop)
+                        # store keypoints history if pose model
+                        if kpt_arr is not None:
+                            history = track_kpts_history.setdefault(track_id, [])
+                            history.append(kpt_arr[i])
+                            # optionally flush to disk so data isn't lost
+                            if save_kpts_dir is not None and is_pose_model:
+                                out_path = Path(save_kpts_dir)
+                                out_path.mkdir(parents=True, exist_ok=True)
+                                try:
+                                    np.save(out_path / f"track_{track_id}.npy", np.stack(history))
+                                except Exception:
+                                    pass
 
-                if len(track_history[track_id]) == num_video_sequence_samples and frame_counter % skip_frame == 0:
-                    start_time = time.time()
-                    crops = video_classifier.preprocess_crops_for_video_cls(track_history[track_id])
-                    end_time = time.time()
-                    preprocess_time = end_time - start_time
-                    print(f"video cls preprocess time: {preprocess_time:.4f} seconds")
-                    crops_to_infer.append(crops)
-                    track_ids_to_infer.append(track_id)
+                    if len(track_history[track_id]) > num_video_sequence_samples:
+                        track_history[track_id].pop(0)
+                        if is_pose_model:
+                            track_kpts_history[track_id].pop(0)
 
-            if crops_to_infer and (
-                not pred_labels
-                or frame_counter % int(num_video_sequence_samples * skip_frame * (1 - video_cls_overlap_ratio)) == 0
-            ):
-                crops_batch = torch.cat(crops_to_infer, dim=0)
+                    if len(track_history[track_id]) == num_video_sequence_samples and frame_counter % skip_frame == 0:
+                        start_time = time.time()
+                        crops = video_classifier.preprocess_crops_for_video_cls(track_history[track_id])
+                        end_time = time.time()
+                        preprocess_time = end_time - start_time
+                        print(f"video cls preprocess time: {preprocess_time:.4f} seconds")
+                        crops_to_infer.append(crops)
+                        track_ids_to_infer.append(track_id)
 
-                start_inference_time = time.time()
-                output_batch = video_classifier(crops_batch)
-                end_inference_time = time.time()
-                inference_time = end_inference_time - start_inference_time
-                print(f"video cls inference time: {inference_time:.4f} seconds")
+                if crops_to_infer and (
+                    not pred_labels
+                    or frame_counter % int(num_video_sequence_samples * skip_frame * (1 - video_cls_overlap_ratio)) == 0
+                ):
+                    crops_batch = torch.cat(crops_to_infer, dim=0)
 
-                pred_labels, pred_confs = video_classifier.postprocess(output_batch)
+                    start_inference_time = time.time()
+                    output_batch = video_classifier(crops_batch)
+                    end_inference_time = time.time()
+                    inference_time = end_inference_time - start_inference_time
+                    print(f"video cls inference time: {inference_time:.4f} seconds")
 
-            if track_ids_to_infer and crops_to_infer:
-                for box, track_id, pred_label, pred_conf in zip(boxes, track_ids_to_infer, pred_labels, pred_confs):
-                    top2_preds = sorted(zip(pred_label, pred_conf), key=lambda x: x[1], reverse=True)
-                    label_text = " | ".join([f"{label} ({conf:.2f})" for label, conf in top2_preds])
-                    annotator.box_label(box, label_text, color=(0, 0, 255))
+                    pred_labels, pred_confs = video_classifier.postprocess(output_batch)
 
-            # overlay keypoints if present
-            if kpt_arr is not None:
-                for kp in kpt_arr:
-                    annotator.kpts(kp, shape=(frame_height, frame_width))
+                if track_ids_to_infer and crops_to_infer:
+                    if draw_boxes:
+                        for box, track_id, pred_label, pred_conf in zip(boxes, track_ids_to_infer, pred_labels, pred_confs):
+                            top2_preds = sorted(zip(pred_label, pred_conf), key=lambda x: x[1], reverse=True)
+                            label_text = " | ".join([f"{label} ({conf:.2f})" for label, conf in top2_preds])
+                            annotator.box_label(box, label_text, color=(0, 0, 255))
 
-        # Write the annotated frame to the output video
+                # overlay keypoints if present
+                # show main annotated frame
+                cv2.imshow("Video", frame)
+                if output_path is not None:
+                    out.write(frame)
+                last_kp_arr = None
+                if kpt_arr is not None and overlay_pose:
+                    # iterate elements individually and coerce each one to numpy; some
+                    # YOLO variants may emit ragged/irregular lists which would confuse
+                    # a full-array conversion.
+                    for raw in kpt_arr:
+                        try:
+                            kp_arr = np.asarray(raw)
+                        except Exception:
+                            continue
+                        # collapse any extra leading dims so we always end up with
+                        # shape (M,2|3)
+                        if kp_arr.ndim > 2:
+                            try:
+                                kp_arr = kp_arr.reshape(-1, kp_arr.shape[-2], kp_arr.shape[-1])
+                            except Exception:
+                                # if reshape fails, just skip this entry
+                                continue
+                        last_kp_arr = kp_arr
+                        for kp in kp_arr:
+                            annotator.kpts(kp, shape=(frame_height, frame_width))
+                if visualize_pose:
+                    # draw last kp_arr on separate window, or blank if missing
+                    if last_kp_arr is not None:
+                        pose_img = draw_pose_on_blank(last_kp_arr, (frame_height, frame_width))
+                    else:
+                        # no keypoints this frame, produce an empty canvas
+                        pose_img = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+                    cv2.imshow("Pose", pose_img)
+                    if pose_writer is not None:
+                        pose_writer.write(pose_img)
+                # refresh windows and allow quit
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+    finally:
+        # always release resources
+        cap.release()
         if output_path is not None:
-            out.write(frame)
-
-        # Display the annotated frame
-        cv2.imshow("YOLOv8 Tracking with S3D Classification", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    cap.release()
-    if output_path is not None:
-        out.release()
-    cv2.destroyAllWindows()
-
-
+            out.release()
+        if pose_writer is not None:
+            pose_writer.release()
+        cv2.destroyAllWindows()
 def parse_opt() -> argparse.Namespace:
     """Parse command line arguments for action recognition pipeline."""
     parser = argparse.ArgumentParser()
@@ -522,8 +628,37 @@ def parse_opt() -> argparse.Namespace:
         "--labels",
         nargs="+",
         type=str,
-        default=["dancing", "singing a song"],
+        default=["jab", "cross", "hook", "front kick"],
         help="labels for zero-shot video classification",
+    )
+    parser.add_argument(
+        "--save-kpts-dir",
+        type=str,
+        default=None,
+        help="optional directory where per-track keypoint sequences will be saved",
+    )
+    parser.add_argument(
+        "--visualize-pose",
+        action="store_true",
+        help="display a separate window showing only the pose skeleton on black",
+    )
+    parser.add_argument(
+        "--pose-output-path",
+        type=str,
+        default=None,
+        help="file to write the pose-only video (requires --visualize-pose). ``datasets/pose_video.mp4`` if omitted",
+    )
+    parser.add_argument(
+        "--no-boxes",
+        dest="draw_boxes",
+        action="store_false",
+        help="do not draw bounding boxes on the main video (useful for pose models)",
+    )
+    parser.add_argument(
+        "--no-overlay-pose",
+        dest="overlay_pose",
+        action="store_false",
+        help="do not overlay pose skeletons on the main video",
     )
     return parser.parse_args()
 
@@ -536,3 +671,7 @@ def main(opt: argparse.Namespace) -> None:
 if __name__ == "__main__":
     opt = parse_opt()
     main(opt)
+
+#python action_recognition.py --weights yolo26n-pose.pt --device 0 --source "https://www.youtube.com/watch?v=ymNcMLqzNwI" --output-path output_video.mp4 --video-classifier-model microsoft/xclip-base-patch32 --save-kpts-dir keypoints --visualize-pose --pose-output-path datasets/pose_video.mp4
+
+#python action_recognition.py --weights yolo26n-pose.pt --device 0 --source "https://www.youtube.com/watch?v=ymNcMLqzNwI" --output-path output_video.mp4 --video-classifier-model microsoft/xclip-base-patch32 --save-kpts-dir keypoints --visualize-pose --pose-output-path datasets/pose_video.mp4 --no-boxes   
