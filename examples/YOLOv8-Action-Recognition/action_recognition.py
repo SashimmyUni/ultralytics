@@ -1,11 +1,12 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from __future__ import annotations
-
+from collections import Counter
 import argparse
 import time
 from collections import defaultdict
 from urllib.parse import urlparse
+import csv
 
 import cv2
 import numpy as np
@@ -17,6 +18,19 @@ from ultralytics.data.loaders import get_best_youtube_url
 from ultralytics.utils.plotting import Annotator
 from ultralytics.utils.torch_utils import select_device
 
+
+# COCO-17 skeleton edges (Ultralytics pose models typically use COCO keypoint order)
+COCO17_EDGES = [
+    (5, 7), (7, 9),      # left arm
+    (6, 8), (8, 10),     # right arm
+    (11, 13), (13, 15),  # left leg
+    (12, 14), (14, 16),  # right leg
+    (5, 6),              # shoulders
+    (11, 12),            # hips
+    (5, 11), (6, 12),    # torso
+    (0, 1), (0, 2),      # nose->eyes
+    (1, 3), (2, 4),      # eyes->ears
+]
 
 class TorchVisionVideoClassifier:
     """Video classifier using pretrained TorchVision models for action recognition.
@@ -280,6 +294,40 @@ class HuggingFaceVideoClassifier:
         return pred_labels, pred_confs
 
 
+def shorten_label(label: str) -> str:
+    """Convert long label description to short display name.
+
+    Args:
+        label (str): The long label description.
+
+    Returns:
+        (str): The shortened label for display.
+    """
+    label_lower = label.lower()
+    if "left arm" in label_lower and "punch" in label_lower and "uppercut" not in label_lower and "hook" not in label_lower:
+        return "Left Punch"
+    elif "right arm" in label_lower and "punch" in label_lower and "uppercut" not in label_lower and "hook" not in label_lower:
+        return "Right Punch"
+    elif "uppercut" in label_lower and "left" in label_lower:
+        return "Left Uppercut"
+    elif "uppercut" in label_lower and "right" in label_lower:
+        return "Right Uppercut"
+    elif "hook" in label_lower and "left" in label_lower:
+        return "Left Hook"
+    elif "hook" in label_lower and "right" in label_lower:
+        return "Right Hook"
+    elif "front kick" in label_lower and "left" in label_lower:
+        return "Left Front Kick"
+    elif "front kick" in label_lower and "right" in label_lower:
+        return "Right Front Kick"
+    elif "roundhouse kick" in label_lower and "left" in label_lower:
+        return "Left Roundhouse"
+    elif "roundhouse kick" in label_lower and "right" in label_lower:
+        return "Right Roundhouse"
+    else:
+        return label[:30]  # Fallback: return first 30 chars
+
+
 def crop_and_pad(frame: np.ndarray, box: list[float], margin_percent: int) -> np.ndarray:
     """Crop box with margin and take square crop from frame.
 
@@ -312,7 +360,7 @@ def crop_and_pad(frame: np.ndarray, box: list[float], margin_percent: int) -> np
 
 
 def run(
-    weights: str = "yolo11n.pt",
+    weights: str = "yolo26n-pose.pt",
     device: str = "",
     source: str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     output_path: str | None = None,
@@ -321,7 +369,7 @@ def run(
     skip_frame: int = 2,
     video_cls_overlap_ratio: float = 0.25,
     fp16: bool = False,
-    video_classifier_model: str = "microsoft/xclip-base-patch32",
+    video_classifier_model: str = "microsoft/xclip-base-patch16-zero-shot",
     labels: list[str] | None = None,
 ) -> None:
     """Run action recognition on a video source using YOLO for object detection and a video classifier.
@@ -388,6 +436,11 @@ def run(
     crops_to_infer = []
     pred_labels = []
     pred_confs = []
+    # Counters for captured labels
+    label_counts = Counter()
+    track_label_counts = defaultdict(Counter)
+    # Track previous label for each track to detect label changes
+    track_previous_labels = {}
 
     while cap.isOpened():
         success, frame = cap.read()
@@ -403,8 +456,30 @@ def run(
             boxes = results[0].boxes.xyxy.cpu().numpy()
             track_ids = results[0].boxes.id.cpu().numpy()
 
-            # Visualize prediction
+            # Keypoints (pose)
+            kps_xy = None
+            kps_cf = None
+            if results[0].keypoints is not None:
+                kps_xy = results[0].keypoints.xy.cpu().numpy()    # (N, K, 2)
+                kps_cf = results[0].keypoints.conf.cpu().numpy()  # (N, K)
+
+            # Visualize prediction (keep this for action labels)
             annotator = Annotator(frame, line_width=3, font_size=10, pil=False)
+
+            # Draw stickman skeletons (instead of boxes)
+            if kps_xy is not None and kps_cf is not None:
+                for person_xy, person_cf in zip(kps_xy, kps_cf):
+                    # joints
+                    for (x, y), c in zip(person_xy, person_cf):
+                        if c > 0.3:
+                            cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 0), -1)
+
+                    # bones
+                    for a, b in COCO17_EDGES:
+                        if person_cf[a] > 0.3 and person_cf[b] > 0.3:
+                            xa, ya = person_xy[a]
+                            xb, yb = person_xy[b]
+                            cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), (0, 255, 0), 2)
 
             if frame_counter % skip_frame == 0:
                 crops_to_infer = []
@@ -441,18 +516,57 @@ def run(
 
                 pred_labels, pred_confs = video_classifier.postprocess(output_batch)
 
-            if track_ids_to_infer and crops_to_infer:
-                for box, track_id, pred_label, pred_conf in zip(boxes, track_ids_to_infer, pred_labels, pred_confs):
-                    top2_preds = sorted(zip(pred_label, pred_conf), key=lambda x: x[1], reverse=True)
-                    label_text = " | ".join([f"{label} ({conf:.2f})" for label, conf in top2_preds])
-                    annotator.box_label(box, label_text, color=(0, 0, 255))
+            if track_ids_to_infer and crops_to_infer and pred_labels:
+                # Map predictions by track id
+                pred_map = {
+                    int(tid): (labs, confs)
+                    for tid, labs, confs in zip(track_ids_to_infer, pred_labels, pred_confs)
+                }
+
+                # Draw per current detection
+                for box, tid in zip(boxes, track_ids):
+                    tid = int(tid)
+                    if tid not in pred_map:
+                        continue
+
+                    labs, confs = pred_map[tid]
+                    top2_preds = sorted(zip(labs, confs), key=lambda x: x[1], reverse=True)
+                    best_label = top2_preds[0][0].lower()
+
+                    # Count only when label changes for this track
+                    prev_label = track_previous_labels.get(tid)
+                    if prev_label != best_label:
+                        label_counts[best_label] += 1
+                        track_label_counts[tid][best_label] += 1
+                        track_previous_labels[tid] = best_label
+
+                    short_labels = [(shorten_label(label), conf) for label, conf in top2_preds]
+                    label_text = " | ".join([f"{label} ({conf:.2f})" for label, conf in short_labels])
+
+                    # ---- Color Logic ----
+                    if "punch" in best_label or "jab" in best_label or "cross" in best_label or "hook" in best_label or "uppercut" in best_label:
+                        color = (0, 0, 255)      # Red (BGR)
+                    elif "kick" in best_label:
+                        color = (255, 0, 0)      # Blue (BGR)
+                    elif "stance" in best_label:
+                        color = (150, 150, 0)    # Yellow
+                    else:
+                        color = (255, 255, 255)  # White fallback
+
+                    annotator.box_label(box, label_text, color=color)
+
+        # Display cumulative label counts
+        counts_items = label_counts.most_common(5)
+        if counts_items:
+            counts_text = " | ".join([f"{shorten_label(k)}: {v}" for k, v in counts_items])
+            cv2.putText(frame, counts_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         # Write the annotated frame to the output video
         if output_path is not None:
             out.write(frame)
 
         # Display the annotated frame
-        cv2.imshow("YOLOv8 Tracking with S3D Classification", frame)
+        cv2.imshow("YOLOv26 Tracking with S3D Classification", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
@@ -462,11 +576,22 @@ def run(
         out.release()
     cv2.destroyAllWindows()
 
+    # Save global label counts to CSV
+    try:
+        csv_path = output_path + "_counts.csv" if output_path is not None else "label_counts.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["label", "count"])
+            for label, count in label_counts.most_common():
+                writer.writerow([label, count])
+        print(f"Saved label counts to {csv_path}")
+    except Exception as e:
+        print(f"Failed to save label counts to CSV: {e}")
 
 def parse_opt() -> argparse.Namespace:
     """Parse command line arguments for action recognition pipeline."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=str, default="yolo11n.pt", help="ultralytics detector model path")
+    parser.add_argument("--weights", type=str, default="yolo26n-pose.pt", help="ultralytics detector model path")
     parser.add_argument("--device", default="", help='cuda device, i.e. 0 or 0,1,2,3 or cpu/mps, "" for auto-detection')
     parser.add_argument(
         "--source",
@@ -487,15 +612,26 @@ def parse_opt() -> argparse.Namespace:
     )
     parser.add_argument("--fp16", action="store_true", help="use FP16 for inference")
     parser.add_argument(
-        "--video-classifier-model", type=str, default="microsoft/xclip-base-patch32", help="video classifier model name"
+        "--video-classifier-model", type=str, default="microsoft/xclip-base-patch16-zero-shot", help="video classifier model name"
     )
     parser.add_argument(
-        "--labels",
-        nargs="+",
-        type=str,
-        default=["dancing", "singing a song"],
-        help="labels for zero-shot video classification",
-    )
+    "--labels",
+    nargs="+",
+    type=str,
+    default=[
+        "left punch",
+        "right punch",
+        "left uppercut",
+        "right uppercut",
+        "left hook",
+        "right hook",
+        "right front kick",
+        "left front kick",
+        "left roundhouse kick",
+        "right roundhouse kick",
+    ],
+    help="labels for zero-shot video classification",
+)
     return parser.parse_args()
 
 
@@ -507,3 +643,6 @@ def main(opt: argparse.Namespace) -> None:
 if __name__ == "__main__":
     opt = parse_opt()
     main(opt)
+
+
+#python action_recognition.py --source "https://www.youtube.com/watch?v=y59uqLjD7Zs" --device 0 --video-classifier-model "microsoft/xclip-base-patch32" --num-video-sequence-samples 8 --skip-frame 2 --video-cls-overlap-ratio 0.5 --fp16 --output-path Test2.mp4
